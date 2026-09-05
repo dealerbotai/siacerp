@@ -72,12 +72,13 @@ requieren tarea aprobada y migración.
 | **RD-8** | **Auto-actualizador de aplicativo**: El sistema consulta de manera asíncrona un manifiesto remoto (`version.json`). Si detecta una versión superior a `__version__` y hay red, pregunta al usuario mediante un modal si desea actualizar automáticamente. | ✅ Implementada (reglas D-21 a D-25) |
 | **RD-9** | **Identidad global por registro (columna `uuid`)**: dos terminales de la MISMA empresa pueden generar el mismo `id` INTEGER offline y pisarse en Supabase. Solución aditiva: columna `uuid` (uuid4) en cada tabla sincronizable; el `id` INTEGER local se conserva como clave interna y el `uuid` es la identidad estable de merge entre terminales. Implementación completa en repo: fase 1 local (`_migrar_uuids` + backfill + garantía en `sync_hooks` + upsert local por uuid); fase 2 de subida vía RPC `subir_registro_sync` (scripts remotos `mobile/supabase/005_...` y `006_...`: columna + índice único `(empresa_id, uuid)` + default `gen_random_uuid()`, merge por uuid conservando el id remoto, adopción de legados sin uuid, regla de convergencia por "huella" conmutable, y colisiones reales de id reubicadas en **espacio negativo** que nunca choca con secuencias/triggers/móvil). El móvil ya envía `uuid` en sus inserts. **Activación:** aplicar 005 y 006 en Supabase y luego encender `[sync] subir_por_uuid=1` en `config.ini` (el camino REST previo queda como respaldo). | ✅ Implementada (activar tras desplegar 005+006) |
 
-> **Nota (2026-09-05):** el cuerpo de las reglas **D-11 a D-25** (RLS
-> multi-tenant, servicios TypeScript móvil y auto-actualizador — citadas en
-> CHANGELOG y en la fila RD-8) se perdió en un merge que truncó este
-> documento (commit 282c03d) y no sobrevive en el historial. Deben
-> re-documentarse; mientras tanto, las referencias existentes quedan como
-> están.
+> **Nota de reconstrucción (2026-09-05):** las subsecciones 6.4 a 6.6 y sus
+> reglas **D-11 a D-25** (RLS multi-tenant, servicios TypeScript del móvil y
+> auto-actualizador) se perdieron en un merge que truncó este documento
+> (commit 282c03d) y no sobreviven en el historial. Se re-documentaron a
+> partir del código real (`mobile/supabase/`, `mobile/src/servicios/`,
+> `src/services/actualizacion_service.py`, `src/utils/updater_utils.py`, y
+> `version.json`); si se recupera el texto original, se coteja y reemplaza.
 
 ---
 
@@ -323,6 +324,135 @@ cada capa tiene un **contrato**:
   español, minúscula, `snake_case`. Crear un estatus nuevo **sin documentarlo**
   en esa tabla está **PROHIBIDO**.
 
+### 6.4 Row Level Security (multi-tenant en Supabase)
+
+**[CONTEXTO]** Cada fila remota pertenece a una empresa (`empresa_id`) y el
+acceso se aísla con **RLS por fila** en cada tabla `*_movil`. El esquema remoto
+de referencia vive en `mobile/supabase/schema_multi_tenant.sql`; el
+`super_admin` (rol global, puede tener `empresa_id` NULL) ve y administra
+todas las empresas y sus datos vía `mobile/supabase/migrar_rls_super_admin.sql`.
+
+- **[REGLAS D-11]** **Toda tabla multi-tenant lleva `empresa_id`** (UUID,
+  `REFERENCES empresas(id)`) y **DEBE** tener `ENABLE ROW LEVEL SECURITY`.
+  **PROHIBIDO** crear en Supabase una tabla de negocio sin RLS activado ni
+  columna `empresa_id`.
+- **[REGLAS D-12]** Toda tabla multi-tenant necesita **políticas por operación**
+  con el alcance mínimo: `SELECT` para usuarios de su empresa, `INSERT` /
+  `UPDATE` / `DELETE` restringidos por rol y empresa. El `super_admin` recibe
+  políticas de bypass (`USING (es_super_admin())`) que cubren las operaciones
+  que requiera el panel de administración.
+- **[REGLAS D-13]** Las funciones auxiliares de RLS viven como
+  `SECURITY DEFINER STABLE` en el esquema y **no** dependen de la sesión del
+  llamador:
+  - `es_super_admin()` — true si `perfiles_usuario.rol = 'super_admin'`.
+  - `empresa_esta_activa(p_empresa_id)` — true si la empresa existe y su campo
+    `activo = true` (una empresa desactivada deja de verse en móvil y
+    escritorio; el super_admin hace bypass).
+  - `verificar_login_movil(p_user_id)` — valida login móvil: perfil existente,
+    usuario activo y empresa activa (el super_admin no requiere empresa).
+- **[REGLAS D-14]** Patrón obligatorio de política por empresa (template):
+  ```sql
+  ALTER TABLE {tabla}_movil ENABLE ROW LEVEL SECURITY;
+  DROP POLICY IF EXISTS "Usuarios leen {tabla} de su empresa" ON {tabla}_movil;
+  CREATE POLICY "Usuarios leen {tabla} de su empresa"
+      ON {tabla}_movil FOR SELECT
+      USING (
+          es_super_admin()
+          OR (
+              empresa_esta_activa(empresa_id)
+              AND empresa_id IN (
+                  SELECT empresa_id FROM perfiles_usuario
+                  WHERE id = auth.uid()
+              )
+          )
+      );
+  -- INSERT/UPDATE/DELETE: mismo patrón + AND rol = 'admin' cuando aplique
+  -- (los roles básicos leen; admin escribe) y WITH CHECK en INSERT.
+  ```
+  Las políticas se crean siempre con `DROP POLICY IF EXISTS` antes de
+  `CREATE POLICY` (patrón idempotente de `migrar_rls_super_admin.sql`).
+- **[REGLAS D-15]** **Errores comunes a evitar:**
+  - Crear tabla sin `ENABLE ROW LEVEL SECURITY` (Supabase bloquea o expone
+    según el proyecto).
+  - Filtrar por `empresa_id` **solo en el cliente** y no en la política
+    (RLS es la última barrera).
+  - Políticas que dejan `empresa_id NULL` sin cubrir (el super_admin es la
+    única excepción documentada).
+  - Cambiar el rol/`activo` de una empresa o perfil **sin** volver a validar
+    con `es_super_admin()` / `empresa_esta_activa()` el acceso del resto de
+    políticas.
+- **[REGLAS D-16]** El **login** (móvil y escritorio) DEBE validar contra el
+  remoto que el perfil exista, el usuario esté `activo` y su empresa esté
+  `activa` (`verificar_login_movil`); una empresa desactivada **bloquea** el
+  login de sus usuarios (no solo oculta datos).
+- **[REGLAS D-17]** Toda migración RLS nueva se prueba en un proyecto Supabase
+  de pruebas antes de producción, verificando con un perfil de empresa A que
+  **no** ve filas de empresa B, con un rol básico que no escribe donde solo
+  escribe `admin`, y con `super_admin` que sí ve todo.
+
+### 6.5 Servicios TypeScript del móvil (multi-tenant)
+
+**[CONTEXTO]** El móvil (`mobile/`) habla con Supabase a través de
+`mobile/src/servicios/*.ts`, cada servicio con la **misma plantilla** de 5
+funciones: `listar`, `buscar`, `obtener`, `crear`, `actualizar`. La identidad
+de empresa se resuelve con `obtenerEmpresaId()` de `auth.ts` (contexto del
+`super_admin` o la empresa propia).
+
+- **[REGLAS D-18]** Toda función de servicio DEBE, en este orden:
+  1. Validar sesión/cliente: `if (!empresaId || !supabase)` → retornar
+     `{ ok: false, datos: [], error: ... }` (nunca lanzar a ciegas);
+  2. Filtrar **siempre** por empresa: `.eq('empresa_id', empresaId)`;
+  3. Aplicar orden estable al listar (`.order('nombre')` en catálogos,
+     `.order('id', { ascending: false })` en documentos).
+- **[REGLAS D-19]** `obtenerEmpresaId()` es la **única** vía para resolver la
+  empresa activa: devuelve `empresaContexto` si el super_admin seleccionó un
+  contexto, o la empresa propia del perfil. **PROHIBIDO** leer `empresaActual`
+  directamente en servicios (rompe el cambio de contexto del super_admin).
+- **[REGLAS D-20]** Las inserciones nuevas **DEBEN** incluir `uuid`
+  (generado con `generarUuid()` de `mobile/src/lib/uuid.ts`, RD-9) además de
+  `empresa_id`, para que el merge de subida por uuid del escritorio
+  (`subir_registro_sync`, migración remota `mobile/supabase/006_...`) encuentre
+  la fila sin depender del `id` numérico. El `id` de las tablas remotas lo
+  asigna Supabase (mecanismo de secuencia del proyecto desplegado).
+
+### 6.6 Auto-actualizador (RD-8)
+
+**[CONTEXTO]** El escritorio consulta un **manifiesto remoto** `version.json`
+(en la raíz de `main` del repo, servido por GitHub) y, si hay una versión
+superior a la local (`src/__version__.py`), ofrece al usuario instalar la
+nueva versión desde un modal (`DialogoActualizacion` en `main_window.py`).
+Implementación: `src/services/actualizacion_service.py` (orquestación) y
+`src/utils/updater_utils.py` (firma, hash y descarga).
+
+- **[REGLAS D-21]** El manifiesto `version.json` DEBE publicar:
+  `version` (formato CalVersioning `YYYY.M.DD`), `url_instalador` (`.exe`),
+  `url_descarga`, `url_changelog`, `mensaje`, `obligatorio` (bool),
+  `hash_sha256` del instalador y `firma_requerida` (bool). Toda release nueva
+  actualiza este archivo junto con el instalador.
+- **[REGLAS D-22]** La verificación es **asíncrona y silenciosa**
+  (`verificar_en_background`, daemon thread, sin bloquear la UI): al detectar
+  versión remota mayor (`_comparar_versiones`), se muestra el modal de
+  actualización en el hilo principal (vía `QMetaObject.invokeMethod`); ante
+  falta de red o error, el sistema **continúa** sin molestar al usuario.
+- **[REGLAS D-23]** Toda descarga se **verifica antes de ejecutar**:
+  1) SHA-256 contra `hash_sha256` del manifiesto (si se publica);
+  2) **firma digital Authenticode** con `signtool verify /pa` (Windows SDK),
+     validando el emisor del certificado contra `EMISOR_FIRMA_DEFAULT`
+     (configurable en `config.ini` `[actualizacion] firmante=`);
+  3) timestamp (`/tw` contra servidores RFC 3161) para firmas cuyo
+     certificado pudo expirar.
+  Si la firma o el hash no validan, se **borran los temporales** y se aborta
+  la instalación (el instalador pudo ser manipulado).
+- **[REGLAS D-24]** La descarga/instalación corre en un hilo separado con
+  callbacks de progreso y de fin; los instaladores (Inno/NSIS) se ejecutan
+  en modo silencioso (`/SILENT`) solo en Windows y tras las verificaciones de
+  la regla D-23. Los archivos temporales viven en
+  `%TEMP%/siac_actualizacion` y se limpian tras cada intento.
+- **[REGLAS D-25]** Una actualización **obligatoria** (`obligatorio: true`)
+  avisa al usuario que la aplicación se cerrará para instalar; las opcionales
+  se confirman con el usuario. **NUNCA** ejecutar un instalador no verificado
+  ni descargado del manifiesto oficial. La verificación de actualización es
+  opcional y **nunca** debe bloquear el login ni el arranque del sistema.
 ---
 
 ## 7. Controles y componentes (ciclo de vida)
@@ -504,7 +634,8 @@ lo apruebe.
 - [ ] Leí AGENTS.md y README.md completos.
 - [ ] No violé ninguna regla N-*, A-*, D-*, C-*, U-*, P-*, V-*, G-*, I-*,
       ni las decisiones RD-*.
-- [ ] No implementé decisiones RD pendientes (RD-1, RD-2, RD-4) sin tarea aprobada.
+- [ ] No implementé decisiones RD pendientes sin tarea aprobada (ver hoja de
+      ruta, sección 1.1).
 - [ ] Si creé estatus nuevos, los documenté en la tabla de estatus (sección 2).
 - [ ] No reimplementé nada que ya exista en el catálogo/helpers.
 - [ ] La vista no toca modelos/BD; el modelo no tiene lógica de UI.
@@ -515,4 +646,11 @@ lo apruebe.
 - [ ] Type hints presentes; español en todo identificador y texto visible.
 - [ ] `flake8 . --select=E9,F63,F7,F82` sin errores.
 - [ ] `pytest` en verde.
+- [ ] Tabla remota nueva (`*_movil`) con `empresa_id`, RLS habilitado y
+      políticas por operación (D-11 a D-14); migraciones RLS probadas en
+      proyecto de pruebas con aislamiento entre empresas (D-17).
+- [ ] Servicio TS móvil con la plantilla de 5 funciones, filtro `empresa_id`
+      vía `obtenerEmpresaId()` e `uuid` en las inserciones (D-18 a D-20).
+- [ ] Si toqué el auto-actualizador: manifiesto `version.json` publicado,
+      verificaciones de hash/firma/timestamp antes de instalar (D-21 a D-25).
 - [ ] Diff revisado por un revisor buscando violaciones a este documento.
