@@ -52,9 +52,16 @@ class SyncQueueModel:
         """Atajo para encolar un UPDATE."""
         return self.encolar(tabla, registro_id, 'UPDATE', datos)
 
-    def encolar_delete(self, tabla: str, registro_id: int) -> int:
-        """Atajo para encolar un DELETE (soft delete)."""
-        return self.encolar(tabla, registro_id, 'DELETE')
+    def encolar_delete(self, tabla: str, registro_id: int,
+                       datos: Optional[dict] = None) -> int:
+        """Atajo para encolar un DELETE (soft delete).
+
+        datos: opcional; si se pasa (p. ej. {"uuid": ...}) se guarda como
+        snapshot para que el SyncService sepa qué registro borrar en el
+        remoto cuando la identidad local (id) no sea confiable entre
+        terminales.
+        """
+        return self.encolar(tabla, registro_id, 'DELETE', datos)
 
     # ------------------------------------------------------------------
     # Leer la cola

@@ -8,8 +8,11 @@ Cubre:
     - Registro/borrado del histórico en `historico_campos`.
     - Aplicación global (walker + instalador de eventos) y autocompletado.
 
-Se ejecutan headless (QT_QPA_PLATFORM=offscreen, ver conftest.py).
+Se ejecutan headless (QT_QPA_PLATFORM=offscreen, ver conftest.py) y sobre
+una BD sqlite temporal (historico_campos) para no depender de la BD real.
 """
+
+import sqlite3
 
 import pytest
 from PySide6.QtCore import QEvent, QPointF, Qt
@@ -32,22 +35,58 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 _CAMPO = "test_historico_campos"
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _esquema_historico():
-    """Asegura que `historico_campos` exista en la BD (como en el arranque)."""
-    from src.database.db_manager import DatabaseManager
+class _BDTemporal:
+    """Mini DatabaseManager sobre una BD sqlite temporal (mismos métodos)."""
 
-    DatabaseManager().initialize_schema()
+    def __init__(self, path: str) -> None:
+        self.conn = sqlite3.connect(path)
+        self.conn.row_factory = sqlite3.Row
+        cur = self.conn.cursor()
+        cur.execute(
+            "CREATE TABLE historico_campos ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "campo TEXT NOT NULL, valor TEXT NOT NULL, "
+            "updated_at TEXT NOT NULL DEFAULT (datetime('now')), "
+            "UNIQUE (campo, valor))")
+        self.conn.commit()
 
+    def execute(self, query: str, params: tuple = ()):
+        c = self.conn.cursor()
+        c.execute(query, params)
+        self.conn.commit()
+        return c
 
-@pytest.fixture(autouse=True)
-def _limpiar_historico():
-    yield
-    HistoricoCamposModel().borrar(_CAMPO)
+    def fetch_one(self, query: str, params: tuple = ()):
+        c = self.conn.cursor()
+        c.execute(query, params)
+        row = c.fetchone()
+        return dict(row) if row else None
+
+    def fetch_all(self, query: str, params: tuple = ()):
+        c = self.conn.cursor()
+        c.execute(query, params)
+        return [dict(r) for r in c.fetchall()]
 
 
 @pytest.fixture
-def modelo(qapp):
+def bd_historico(tmp_path, monkeypatch):
+    """BD temporal parcheada en el modelo: ninguna prueba toca la BD real."""
+    from src.models import historico_campos_model as mod_modelo
+    bd = _BDTemporal(str(tmp_path / "historico_test.db"))
+    # El componente construye HistoricoCamposModel() por dentro (habilitar_campo,
+    # CampoHistorico, InstaladorHistorico); el parche cubre todas esas rutas.
+    monkeypatch.setattr(mod_modelo, "DatabaseManager", lambda: bd)
+    return bd
+
+
+@pytest.fixture(autouse=True)
+def _limpiar_historico(bd_historico):
+    yield
+    bd_historico.execute("DELETE FROM historico_campos")
+
+
+@pytest.fixture
+def modelo(bd_historico):
     return HistoricoCamposModel()
 
 

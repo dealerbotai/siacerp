@@ -270,6 +270,89 @@ class SupabaseService:
         except Exception as e:
             return {'ok': False, 'error': str(e)}
 
+    # ------------------------------------------------------------------
+    # RPC (fase 2 RD-9): subida por uuid
+    # ------------------------------------------------------------------
+
+    def _leer_config(self) -> configparser.ConfigParser:
+        """Lee config.ini (raiz del proyecto / junto al .exe)."""
+        config = configparser.ConfigParser()
+        ruta = Path(__file__).resolve().parent.parent.parent / 'config.ini'
+        config.read(str(ruta))
+        return config
+
+    def subir_por_uuid_habilitado(self) -> bool:
+        """Indica si la subida usa el RPC por uuid (config [sync]).
+
+        La bandera se enciende SOLO cuando la funcion remota
+        `subir_registro_sync` (006_subir_por_uuid.sql) ya esta desplegada.
+        Por defecto apagada: el camino REST historico sigue siendo el
+        predeterminado.
+        """
+        valor = self._leer_config().get('sync', 'subir_por_uuid',
+                                        fallback='0')
+        return valor.strip().lower() in ('1', 'true', 'si', 'yes')
+
+    def _token_servicio(self) -> str:
+        """Token para escrituras: service_role si existe, si no el de sesion."""
+        service_key = self._leer_config().get(
+            'supabase', 'service_role_key', fallback='')
+        return service_key or self._token
+
+    def llamar_rpc(self, nombre: str, parametros: dict) -> dict:
+        """Invoca una funcion RPC de Supabase (PostgREST /rpc/<nombre>).
+
+        Returns:
+            {'ok': True, 'respuesta': <json>} o
+            {'ok': False, 'error': '...'}
+        """
+        if not self.configurado:
+            return {'ok': False, 'error': 'Supabase no configurado'}
+        try:
+            auth_token = self._token_servicio()
+            if not auth_token:
+                return {'ok': False,
+                        'error': 'No autenticado (ni service_role ni sesion)'}
+            req = urllib.request.Request(
+                f'{self.url}/rest/v1/rpc/{nombre}',
+                data=json.dumps(parametros).encode(),
+                headers={
+                    'apikey': self.anon_key,
+                    'Authorization': f'Bearer {auth_token}',
+                    'Content-Type': 'application/json',
+                    'Prefer': 'return=representation',
+                },
+                method='POST',
+            )
+            resp = urllib.request.urlopen(req, timeout=30)
+            texto = resp.read().decode()
+            if not texto.strip():
+                return {'ok': True, 'respuesta': None}
+            return {'ok': True, 'respuesta': json.loads(texto)}
+        except urllib.error.HTTPError as e:
+            cuerpo = e.read().decode()
+            return {'ok': False, 'error': f'HTTP {e.code}: {cuerpo[:200]}'}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    def subir_registro_por_uuid(self, tabla: str, datos: dict) -> dict:
+        """Sube UN registro por identidad uuid via `subir_registro_sync`.
+
+        La funcion remota decide: actualizar por uuid, insertar, adoptar
+        legados, converger o reubicar en id negativo (ver 006).
+
+        Returns:
+            {'ok': True, 'accion': ..., 'id': ...} o {'ok': False, 'error'}
+        """
+        resultado = self.llamar_rpc('subir_registro_sync', {
+            'p_tabla': tabla,
+            'p_datos': datos,
+        })
+        if not resultado.get('ok'):
+            return resultado
+        respuesta = resultado.get('respuesta') or {}
+        return {'ok': True, **respuesta}
+
     def obtener_tabla(self, tabla: str, filtros: str = '') -> list[dict]:
         """Obtiene datos de una tabla en Supabase.
 

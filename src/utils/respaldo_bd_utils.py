@@ -113,13 +113,10 @@ def _json_a_valor(valor):
 
 # ---------------------------------------------------------------- export
 def _columnas_tabla(db: DatabaseManager, tabla: str) -> list[str]:
-    if db.engine == "sqlite":
-        filas = db.fetch_all(f"PRAGMA table_info({tabla})")
-        return [f["name"] for f in filas]
-    filas = db.fetch_all(
-        "SELECT column_name FROM information_schema.columns "
-        "WHERE table_name = %s ORDER BY ordinal_position", (tabla,))
-    return [f["column_name"] for f in filas]
+    """Columnas de la tabla en orden de definición (vía dialecto activo)."""
+    conn = db.connect()
+    cursor = conn.cursor()
+    return db.dialecto.obtener_columnas(cursor, tabla)
 
 
 def exportar_conjuntos(claves: list[str], ruta: str) -> dict:
@@ -197,22 +194,18 @@ def _columnas_seguras(db: DatabaseManager, tabla: str,
     return seguras
 
 
-def _desactivar_fk(cursor, engine: str) -> None:
+def _desactivar_fk(cursor, dialecto) -> None:
+    """Desactiva las FK de la sesión (delegado al dialecto)."""
     try:
-        if engine == "sqlite":
-            cursor.execute("PRAGMA foreign_keys=OFF")
-        else:
-            cursor.execute("SET session_replication_role = replica")
+        dialecto.desactivar_fk(cursor)
     except Exception as e:
         print(f"Respaldo: no se pudieron desactivar las FK ({e})")
 
 
-def _restaurar_fk(cursor, engine: str) -> None:
+def _restaurar_fk(cursor, dialecto) -> None:
+    """Reactiva las FK de la sesión (delegado al dialecto)."""
     try:
-        if engine == "sqlite":
-            cursor.execute("PRAGMA foreign_keys=ON")
-        else:
-            cursor.execute("SET session_replication_role = DEFAULT")
+        dialecto.restaurar_fk(cursor)
     except Exception:
         pass
 
@@ -263,7 +256,7 @@ def importar_conjuntos(ruta: str, claves: list[str],
 
     try:
         conn.commit()  # cierra cualquier transacción pendiente (PRAGMA)
-        _desactivar_fk(cursor, db.engine)
+        _desactivar_fk(cursor, db.dialecto)
 
         if reemplazar:
             for tabla in reversed(tablas):
@@ -282,14 +275,8 @@ def importar_conjuntos(ruta: str, claves: list[str],
                     _error(f"{tabla}: columnas no reconocidas, se omitió.")
                 continue
             lista_cols = ", ".join(columnas)
-            marcadores = ", ".join("?" if db.engine == "sqlite" else "%s"
-                                   for _ in columnas)
-            prefijo = "INSERT OR IGNORE INTO" if db.engine == "sqlite" \
-                else "INSERT INTO"
-            sufijo = "" if db.engine == "sqlite" or reemplazar \
-                else " ON CONFLICT (id) DO NOTHING"
-            sql = (f"{prefijo} {tabla} ({lista_cols}) "
-                   f"VALUES ({marcadores}){sufijo}")
+            sql = db.dialecto.sql_insertar_o_ignorar(
+                tabla, columnas, con_conflicto_id=not reemplazar)
             insertadas = omitidas = 0
             for fila in filas:
                 valores = [_json_a_valor(v) for v in fila[:len(columnas)]]
@@ -310,18 +297,14 @@ def importar_conjuntos(ruta: str, claves: list[str],
         if db.engine == "postgresql":
             for tabla in tablas:
                 try:
-                    cursor.execute(
-                        "SELECT setval(pg_get_serial_sequence(%s, 'id'), "
-                        f"GREATEST((SELECT COALESCE(MAX(id), 1) "
-                        f"FROM {tabla}), 1))", (tabla,))
+                    db.dialecto.reajustar_secuencia(cursor, tabla)
                 except Exception:
                     pass  # tablas sin secuencia (catálogos fijos, etc.)
 
         if db.engine == "sqlite":
             try:
-                violaciones = cursor.execute(
-                    "PRAGMA foreign_key_check").fetchall()
-                resumen["fk_violaciones"] = len(violaciones)
+                resumen["fk_violaciones"] = \
+                    db.dialecto.contar_violaciones_fk(cursor)
             except Exception:
                 pass
 
@@ -330,5 +313,5 @@ def importar_conjuntos(ruta: str, claves: list[str],
         conn.rollback()
         raise
     finally:
-        _restaurar_fk(cursor, db.engine)
+        _restaurar_fk(cursor, db.dialecto)
     return resumen

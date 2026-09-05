@@ -6,6 +6,33 @@
 
 ---
 
+## [Unreleased] — 2026-09-05
+
+### Added
+- **Capa de acceso a datos agnóstica al motor (SQLite/PostgreSQL):**
+  - `src/database/dialectos.py`: dialectos SQLite/PostgreSQL (placeholder, `ahora()`, `auto_incremento()`, booleano, BLOB, introspección y helpers de respaldo: FK, insert-or-ignore, secuencias)
+  - `DatabaseManager._adaptar`: convierte placeholders `?` → `%s` automáticamente en PostgreSQL; los modelos existentes no cambian
+  - `src/database/base_repositorio.py`: repositorio base con CRUD genérico, filtros multi-tenant y hooks de sync
+  - Migrados a `BaseRepositorio`: `TallasModel`, `ColoresModel`, `UnidadesMedidaModel`, `ProveedorModel` e `InsumoModel`
+  - `respaldo_bd_utils.py` sin ramas por motor (delega en el dialecto)
+- **Identidad global por registro `uuid` (RD-9, fases 1 y 2):**
+  - Fase 1 local: migración `_migrar_uuids` (columna + backfill), `sync_hooks` garantizan uuid al encolar, `_upsert_local` resuelve por uuid (colisión de ids entre terminales)
+  - Fase 2 remota: RPC `subir_registro_sync` (migración 006) — merge por uuid conservando el id remoto, adopción de filas legadas sin uuid, regla de convergencia por "huella" y reubicación de colisiones en id negativo
+  - `SupabaseService`: `llamar_rpc()`, `subir_registro_por_uuid()`, `subir_por_uuid_habilitado()`
+  - `SyncService._enviar_registro`: usa el snapshot vivo (uuid garantizado) y cae al REST histórico si el RPC no está desplegado (HTTP 404); se activa con `[sync] subir_por_uuid=1`
+  - Migraciones Supabase `005_agregar_uuid_identidad.sql` y `006_subir_por_uuid.sql`
+  - App móvil: `generarUuid()` y `uuid` en los inserts de pedidos/programación
+
+### Changed
+- **AGENTS.md:** Eliminada la duplicación del documento (dos versiones concatenadas) y documentada la decisión **RD-9** con su glosario
+
+### Fixed
+- Migraciones 005/006 tolerantes a tablas no existentes en el proyecto (modelos/variantes/proveedores `_movil`) y al trigger de timestamp sin columna `updated_at` (caso de la migración 004)
+- `test_ficha_tecnica_model.py`: reescrito contra la API actual de la ficha técnica (la anterior probaba un diseño eliminado)
+- `test_campo_historico.py`: aislado en BD temporal y corregido el orden "más reciente primero" (formato de marca con segundos + guarda monótona); suite completa en verde: **265 pruebas**
+
+---
+
 ## [Unreleased] — 2026-08-31
 
 ### Added
@@ -334,6 +361,7 @@
 | **RD-5** | Motor BD: PostgreSQL producción, SQLite desarrollo | Vigente |
 | **RD-6** | Todo componente aprobado debe incluir prueba `pytest` | Vigente |
 | **RD-7** | Archivos de raíz documentados; `opencode.json` protegido | 2026-08-12 |
+| **RD-9** | Identidad global por registro: columna `uuid` + RPC `subir_registro_sync` | 2026-09-05 |
 
 ---
 
@@ -361,12 +389,12 @@
 |---|---|
 | **Commits totales** | 93+ |
 | **Primera actividad** | 2026-08-04 |
-| **Última actividad** | 2026-08-30 |
+| **Última actividad** | 2026-09-05 |
 | **Contribuyentes** | 3 |
 | **Pull requests mergeados** | 10+ |
 | **Componentes aprobados** | 11 |
 | **Archivos de código fuente** | 80+ |
-| **Pruebas pytest** | 17 |
+| **Pruebas pytest** | 265 |
 | **App móvil (pantallas)** | 14 |
 | **Servicios móviles** | 7 |
 | **Empresas multi-tenant** | 3 |

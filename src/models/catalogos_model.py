@@ -1,7 +1,7 @@
-from src.database.db_manager import DatabaseManager
+from src.database.base_repositorio import BaseRepositorio
 
 
-class TallasModel:
+class TallasModel(BaseRepositorio):
     """Catálogo unificado de tallas/puntos (RD-1).
 
     Un solo catálogo configurable, sin campo `orden`: el orden se deriva del
@@ -9,33 +9,17 @@ class TallasModel:
     (de X a Y, en pasos de medio punto).
     """
 
-    def __init__(self) -> None:
-        self.db = DatabaseManager()
-
-    def listar(self, solo_activos: bool = True) -> list[dict]:
-        query = "SELECT * FROM tallas_catalogo"
-        if solo_activos:
-            query += " WHERE activo = 1"
-        query += " ORDER BY CAST(talla AS REAL), talla"
-        return self.db.fetch_all(query)
+    tabla = "tallas_catalogo"
+    sincronizable = False           # no se sube a Supabase (TABLAS_BAJAR)
+    con_soft_delete = False         # no tiene columna is_deleted
+    usa_empresa = False             # catálogo compartido, sin empresa_id
+    orden_por_defecto = "CAST(talla AS REAL), talla"
 
     def crear(self, talla: str) -> int:
-        cursor = self.db.execute(
-            "INSERT INTO tallas_catalogo (talla) VALUES (?)",
-            (talla,),
-        )
-        return cursor.lastrowid
+        return super().crear({"talla": talla})
 
     def actualizar(self, talla_id: int, talla: str) -> None:
-        self.db.execute(
-            "UPDATE tallas_catalogo SET talla=? WHERE id=?",
-            (talla, talla_id),
-        )
-
-    def desactivar(self, talla_id: int) -> None:
-        self.db.execute(
-            "UPDATE tallas_catalogo SET activo=0 WHERE id=?", (talla_id,)
-        )
+        super().actualizar(talla_id, {"talla": talla})
 
     def activar(self, talla_id: int) -> None:
         self.db.execute(
@@ -76,31 +60,18 @@ class TallasModel:
         return f"{entero:02d}.5"
 
 
-class ColoresModel:
-    def __init__(self) -> None:
-        self.db = DatabaseManager()
+class ColoresModel(BaseRepositorio):
+    """Catálogo de colores."""
 
-    def listar(self, solo_activos: bool = True) -> list[dict]:
-        query = "SELECT * FROM colores_catalogo"
-        if solo_activos:
-            query += " WHERE activo = 1"
-        query += " ORDER BY orden, nombre"
-        return self.db.fetch_all(query)
+    tabla = "colores_catalogo"
+    sincronizable = False
+    con_soft_delete = False
+    usa_empresa = False
+    orden_por_defecto = "orden, nombre"
 
     def crear(self, nombre: str, codigo: str, orden: int) -> int:
-        cursor = self.db.execute(
-            "INSERT INTO colores_catalogo (nombre, codigo, orden) VALUES (?, ?, ?)",
-            (nombre, codigo, orden),
-        )
-        return cursor.lastrowid
+        return super().crear({"nombre": nombre, "codigo": codigo, "orden": orden})
 
     def actualizar(self, color_id: int, nombre: str, codigo: str, orden: int) -> None:
-        self.db.execute(
-            "UPDATE colores_catalogo SET nombre=?, codigo=?, orden=? WHERE id=?",
-            (nombre, codigo, orden, color_id),
-        )
-
-    def desactivar(self, color_id: int) -> None:
-        self.db.execute(
-            "UPDATE colores_catalogo SET activo=0 WHERE id=?", (color_id,)
-        )
+        super().actualizar(color_id, {
+            "nombre": nombre, "codigo": codigo, "orden": orden})

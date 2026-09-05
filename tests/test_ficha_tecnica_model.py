@@ -6,7 +6,12 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
 
 class _BDTemporal:
-    """Mini DatabaseManager sobre una BD sqlite temporal (mismos métodos)."""
+    """Mini DatabaseManager sobre una BD sqlite temporal (mismos métodos).
+
+    Esquema equivalente al real de _migrar_fichas_tecnicas: fichas_tecnicas
+    con modelo_id como PK y columnas de caracteristica, mas la tabla de
+    fotos ficha_tecnica_fotos.
+    """
 
     def __init__(self, path: str) -> None:
         self.conn = sqlite3.connect(path)
@@ -19,21 +24,32 @@ class _BDTemporal:
             "created_at TEXT DEFAULT (datetime('now')), "
             "updated_at TEXT DEFAULT (datetime('now')))")
         cur.execute(
-            "CREATE TABLE fichas_tecnicas (id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "modelo_id INTEGER NOT NULL, estilo_sistema TEXT, estilo_muestra TEXT, "
-            "marca TEXT, talla TEXT, genero TEXT, horma TEXT, moldura TEXT, "
-            "construccion TEXT, corrida TEXT, scallop TEXT, tacon TEXT, notas TEXT, "
-            "imagen BLOB, fuente_archivo TEXT, activo INTEGER NOT NULL DEFAULT 1, "
-            "created_at TEXT DEFAULT (datetime('now')), "
-            "updated_at TEXT DEFAULT (datetime('now')))")
+            "CREATE TABLE fichas_tecnicas ("
+            "modelo_id INTEGER PRIMARY KEY REFERENCES modelos(id), "
+            "proyecto TEXT NOT NULL DEFAULT '', "
+            "etapa TEXT NOT NULL DEFAULT 'MUESTRA', "
+            "id_diseno TEXT NOT NULL DEFAULT '', "
+            "ref_cliente TEXT NOT NULL DEFAULT '', "
+            "color_nombre TEXT NOT NULL DEFAULT '', "
+            "cintilla TEXT DEFAULT '', "
+            "piel_corte_1 TEXT DEFAULT '', "
+            "forro TEXT DEFAULT '', "
+            "suela TEXT DEFAULT '', "
+            "tacon TEXT DEFAULT '', "
+            "comentarios TEXT DEFAULT '', "
+            "realizo TEXT DEFAULT '', "
+            "recibio TEXT DEFAULT '', "
+            "created_at TEXT NOT NULL DEFAULT (datetime('now')), "
+            "updated_at TEXT NOT NULL DEFAULT (datetime('now')))")
         cur.execute(
-            "CREATE TABLE ficha_tecnica_secciones (id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "ficha_id INTEGER NOT NULL, nombre TEXT NOT NULL, "
-            "orden INTEGER NOT NULL DEFAULT 0)")
-        cur.execute(
-            "CREATE TABLE ficha_tecnica_detalle (id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "seccion_id INTEGER NOT NULL, componente TEXT, descripcion TEXT, "
-            "proveedor TEXT, comentarios TEXT, orden INTEGER NOT NULL DEFAULT 0)")
+            "CREATE TABLE ficha_tecnica_fotos ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "modelo_id INTEGER NOT NULL REFERENCES modelos(id) "
+            "ON DELETE CASCADE, "
+            "tipo_foto TEXT NOT NULL CHECK(tipo_foto IN "
+            "('producto','tubo','chinela','talon','suela')), "
+            "imagen BLOB, "
+            "UNIQUE(modelo_id, tipo_foto))")
         self.conn.commit()
 
     def execute(self, query: str, params: tuple = ()):
@@ -62,63 +78,119 @@ def bd(tmp_path, monkeypatch):
     return bd
 
 
+def _crear_modelo(bd, codigo: str = "GBC-01", nombre: str = "BOTIN CHIMU") -> int:
+    bd.execute("INSERT INTO modelos (codigo, nombre) VALUES (?, ?)",
+               (codigo, nombre))
+    return bd.fetch_one(
+        "SELECT id FROM modelos WHERE codigo = ?", (codigo,))["id"]
+
+
 class TestFichaTecnicaModel:
     def test_guardar_y_obtener_completa(self, bd):
         from src.models.ficha_tecnica_model import FichaTecnicaModel
-        bd.execute("INSERT INTO modelos (codigo, nombre) VALUES (?, ?)",
-                   ("GBC-01", "BOTIN CHIMU"))
-        modelo_id = bd.fetch_one(
-            "SELECT id FROM modelos WHERE codigo = ?", ("GBC-01",))["id"]
+        modelo_id = _crear_modelo(bd)
         f = FichaTecnicaModel()
-        ficha_id = f.guardar(
-            modelo_id,
-            datos={"estilo_sistema": "GBC-01", "marca": "GORETTI",
-                   "genero": "DAMA", "construccion": "PEGADO"},
-            secciones=[{
-                "nombre": "CORTE",
-                "detalle": [
-                    {"componente": "PIEL", "descripcion": "GORA TAN",
-                     "proveedor": "SULTANA", "comentarios": "DOBLADILLO"},
-                    {"componente": "SUELA", "descripcion": "INTEGRAL",
-                     "proveedor": "", "comentarios": ""},
-                ],
-            }],
-            imagen=b"\x89PNG\r\n\x1a\n",
-            fuente_archivo="prueba.xlsx",
-        )
-        assert ficha_id > 0
 
-        ficha = f.obtener_completa(modelo_id)
+        # Insertar ficha nueva con campos de encabezado y caracteristica.
+        f.guardar(modelo_id, {
+            "proyecto": "P-2026", "etapa": "MUESTRA", "color_nombre": "CAFE",
+            "cintilla": "GAMUZA", "piel_corte_1": "PIEL VACA",
+            "forro": "CERDO", "suela": "TR", "tacon": "3/4",
+            "comentarios": "BORDADO LOGO", "realizo": "MF",
+        })
+
+        ficha = f.obtener(modelo_id)
         assert ficha is not None
-        assert ficha["marca"] == "GORETTI"
-        assert ficha["estilo_sistema"] == "GBC-01"
-        assert ficha["fuente_archivo"] == "prueba.xlsx"
-        assert len(ficha["secciones"]) == 1
-        assert ficha["secciones"][0]["nombre"] == "CORTE"
-        assert len(ficha["secciones"][0]["detalle"]) == 2
-        assert ficha["secciones"][0]["detalle"][1]["componente"] == "SUELA"
+        assert ficha["modelo_id"] == modelo_id
+        assert ficha["proyecto"] == "P-2026"
+        assert ficha["color_nombre"] == "CAFE"
+        assert ficha["cintilla"] == "GAMUZA"
+        assert ficha["piel_corte_1"] == "PIEL VACA"
+        assert ficha["forro"] == "CERDO"
+        assert ficha["suela"] == "TR"
+        assert ficha["tacon"] == "3/4"
+        assert ficha["comentarios"] == "BORDADO LOGO"
+        assert ficha["realizo"] == "MF"
 
-        assert f.obtener_imagen(ficha_id) == b"\x89PNG\r\n\x1a\n"
-
-    def test_obtener_por_modelo_inexistente(self, bd):
+    def test_guardar_actualiza_en_lugar_de_duplicar(self, bd):
         from src.models.ficha_tecnica_model import FichaTecnicaModel
-        assert FichaTecnicaModel().obtener_por_modelo(999) is None
-
-    def test_eliminar_por_modelo_limpia_secciones_y_detalle(self, bd):
-        from src.models.ficha_tecnica_model import FichaTecnicaModel
-        bd.execute("INSERT INTO modelos (codigo, nombre) VALUES (?, ?)",
-                   ("GBC-02", "OTRO"))
-        modelo_id = bd.fetch_one(
-            "SELECT id FROM modelos WHERE codigo = ?", ("GBC-02",))["id"]
+        modelo_id = _crear_modelo(bd)
         f = FichaTecnicaModel()
-        f.guardar(modelo_id, {"marca": "G"},
-                  secciones=[{"nombre": "CORTE",
-                              "detalle": [{"componente": "A"}]}],
-                  imagen=None)
-        assert f.obtener_por_modelo(modelo_id) is not None
-        f.eliminar_por_modelo(modelo_id)
-        assert f.obtener_por_modelo(modelo_id) is None
-        n_sec = bd.fetch_one("SELECT COUNT(*) AS n FROM ficha_tecnica_secciones")["n"]
-        n_det = bd.fetch_one("SELECT COUNT(*) AS n FROM ficha_tecnica_detalle")["n"]
-        assert n_sec == 0
-        assert n_det == 0
+
+        f.guardar(modelo_id, {"proyecto": "P-1", "cintilla": "GAMUZA"})
+        f.guardar(modelo_id, {"cintilla": "BECERRINA", "etapa": "CORTE"})
+
+        ficha = f.obtener(modelo_id)
+        assert ficha["cintilla"] == "BECERRINA"
+        assert ficha["proyecto"] == "P-1"       # el resto no se pisa
+        assert ficha["etapa"] == "CORTE"
+        # modelo_id es PK: una sola fila por modelo.
+        n = bd.fetch_one("SELECT COUNT(*) AS n FROM fichas_tecnicas")["n"]
+        assert n == 1
+
+    def test_guardar_ignora_columnas_desconocidas(self, bd):
+        from src.models.ficha_tecnica_model import FichaTecnicaModel
+        modelo_id = _crear_modelo(bd)
+        FichaTecnicaModel().guardar(modelo_id, {
+            "cintilla": "OK", "columna_inexistente": "X",
+        })
+        ficha = FichaTecnicaModel().obtener(modelo_id)
+        assert ficha["cintilla"] == "OK"
+        assert "columna_inexistente" not in ficha
+
+    def test_obtener_por_modelo_sin_ficha_devuelve_none(self, bd):
+        from src.models.ficha_tecnica_model import FichaTecnicaModel
+        modelo_id = _crear_modelo(bd)
+        assert FichaTecnicaModel().obtener(modelo_id) is None
+        assert FichaTecnicaModel().obtener(999) is None
+
+    def test_fotos_guardar_obtener_y_borrar(self, bd):
+        from src.models.ficha_tecnica_model import FichaTecnicaModel
+        modelo_id = _crear_modelo(bd)
+        f = FichaTecnicaModel()
+
+        imagen = b"\x89PNG\r\n\x1a\n"
+        f.guardar_foto(modelo_id, "producto", imagen)
+        assert f.obtener_foto(modelo_id, "producto") == imagen
+        assert f.obtener_foto(modelo_id, "tubo") is None
+
+        # Reemplazo del mismo tipo (UNIQUE modelo_id, tipo_foto).
+        otra = b"\xff\xd8\xff\xe0"
+        f.guardar_foto(modelo_id, "producto", otra)
+        assert f.obtener_foto(modelo_id, "producto") == otra
+
+        # dict de todas las fotos.
+        f.guardar_foto(modelo_id, "suela", imagen)
+        fotos = f.obtener_fotos(modelo_id)
+        assert fotos["producto"] == otra
+        assert fotos["suela"] == imagen
+
+        # imagen None borra la foto.
+        f.guardar_foto(modelo_id, "producto", None)
+        assert f.obtener_foto(modelo_id, "producto") is None
+        assert f.obtener_fotos(modelo_id) == {"suela": imagen}
+
+    def test_valores_historicos(self, bd):
+        from src.models.ficha_tecnica_model import FichaTecnicaModel
+        m1 = _crear_modelo(bd, "GBC-01", "A")
+        m2 = _crear_modelo(bd, "GBC-02", "B")
+        _crear_modelo(bd, "GBC-03", "C")
+        f = FichaTecnicaModel()
+        f.guardar(m1, {"cintilla": "GAMUZA"})
+        f.guardar(m2, {"cintilla": "BECERRINA"})   # la tercera queda vacia
+
+        assert f.valores_historicos("cintilla") == ["BECERRINA", "GAMUZA"]
+        # Columna no perteneciente a la ficha: sin historico.
+        assert f.valores_historicos("columna_inventada") == []
+
+    def test_eliminar_no_existe_en_api_actual(self, bd):
+        """El borrado de la ficha es responsabilidad del borrado del modelo.
+
+        La API actual no expone eliminar_por_modelo (rediseno de la ficha);
+        se verifica que la ficha se puede guardar y releer sin error.
+        """
+        from src.models.ficha_tecnica_model import FichaTecnicaModel
+        modelo_id = _crear_modelo(bd)
+        f = FichaTecnicaModel()
+        f.guardar(modelo_id, {"suela": "PU"})
+        assert f.obtener(modelo_id)["suela"] == "PU"

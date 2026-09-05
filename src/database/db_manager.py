@@ -2,9 +2,21 @@ import configparser
 import os
 import sqlite3
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+from src.database.dialectos import obtener_dialecto
+
+
+# Tablas sincronizables con Supabase: deben tener identidad global uuid.
+# Union de TABLAS_SUBIR y TABLAS_BAJAR del SyncService (ver sync_service.py).
+_TABLAS_SINCRONIZABLES = [
+    'insumos', 'modelos', 'variantes', 'proveedores', 'clientes',
+    'ordenes_compra', 'detalle_orden_compra', 'ordenes_produccion',
+    'seguimiento_produccion', 'pedidos_cliente', 'programacion_semana',
+    'programacion_lineas', 'programacion_linea_tallas', 'tallas_catalogo',
+]
 
 def directorio_datos() -> Path:
     """Directorio de datos de la aplicación (config.ini y BD SQLite).
@@ -34,6 +46,7 @@ class DatabaseManager:
         self.config = self._load_config()
         self.engine: str = self.config.get('database', 'engine')
         self.connection: Any = None
+        self.dialecto = obtener_dialecto(self.engine)
 
     def _load_config(self) -> configparser.ConfigParser:
         config = configparser.ConfigParser()
@@ -78,17 +91,45 @@ class DatabaseManager:
             self.connection.close()
             self.connection = None
 
+    # ------------------------------------------------------------------
+    # Introspección (delegada al dialecto activo)
+    # ------------------------------------------------------------------
+
+    def _tabla_existe(self, cursor, tabla: str) -> bool:
+        """Indica si la tabla existe en el motor activo."""
+        return self.dialecto.tabla_existe(cursor, tabla)
+
+    def _columnas_de(self, cursor, tabla: str) -> list[str]:
+        """Devuelve los nombres de columna de una tabla existente."""
+        return self.dialecto.obtener_columnas(cursor, tabla)
+
+    def _columna_existe(self, cursor, tabla: str, nombre: str) -> bool:
+        """Indica si la columna existe en la tabla."""
+        return nombre in self._columnas_de(cursor, tabla)
+
+    def _adaptar(self, query: str) -> str:
+        """Convierte placeholders '?' a '%s' cuando el motor es PostgreSQL.
+
+        Los modelos escriben SQL con placeholders '?' (estilo SQLite).
+        psycopg2 requiere '%s', así que se adapta la consulta antes de
+        ejecutarla cuando el motor activo es PostgreSQL. En SQLite la
+        consulta se devuelve sin cambios.
+        """
+        if self.engine != 'postgresql':
+            return query
+        return query.replace('?', '%s')
+
     def execute(self, query: str, params: tuple = ()) -> Any:
         conn = self.connect()
         cursor = conn.cursor()
-        cursor.execute(query, params)
+        cursor.execute(self._adaptar(query), params)
         conn.commit()
         return cursor
 
     def fetch_one(self, query: str, params: tuple = ()) -> Optional[dict]:
         conn = self.connect()
         cursor = conn.cursor()
-        cursor.execute(query, params)
+        cursor.execute(self._adaptar(query), params)
         row = cursor.fetchone()
         if row is None:
             return None
@@ -100,7 +141,7 @@ class DatabaseManager:
     def fetch_all(self, query: str, params: tuple = ()) -> list[dict]:
         conn = self.connect()
         cursor = conn.cursor()
-        cursor.execute(query, params)
+        cursor.execute(self._adaptar(query), params)
         rows = cursor.fetchall()
         if self.engine == 'sqlite':
             return [dict(r) for r in rows]
@@ -129,32 +170,22 @@ class DatabaseManager:
         try:
             conn = self.connect()
             cursor = conn.cursor()
-            if self.engine == 'sqlite':
-                cols = [r[1] for r in cursor.execute("PRAGMA table_info(variantes)").fetchall()]
-                if 'talla' not in cols:
-                    cursor.execute(
-                        "ALTER TABLE variantes ADD COLUMN talla TEXT NOT NULL DEFAULT ''")
-                    conn.commit()
-                    print("Migración: columna talla agregada a variantes.")
-            else:
+            if not self._columna_existe(cursor, 'variantes', 'talla'):
                 cursor.execute(
-                    "ALTER TABLE variantes ADD COLUMN IF NOT EXISTS talla TEXT NOT NULL DEFAULT ''")
+                    "ALTER TABLE variantes ADD COLUMN talla TEXT NOT NULL DEFAULT ''")
                 conn.commit()
+                print("Migración: columna talla agregada a variantes.")
         except Exception as e:
             print(f"Migración talla omitida: {e}")
         try:
             conn = self.connect()
             cursor = conn.cursor()
             for tabla in ("insumos", "modelos"):
-                if self.engine == 'sqlite':
-                    cols = [r[1] for r in cursor.execute(f"PRAGMA table_info({tabla})").fetchall()]
-                    if 'imagen' not in cols:
-                        cursor.execute(f"ALTER TABLE {tabla} ADD COLUMN imagen BLOB")
-                        conn.commit()
-                        print(f"Migración: columna imagen agregada a {tabla}.")
-                else:
-                    cursor.execute(f"ALTER TABLE {tabla} ADD COLUMN IF NOT EXISTS imagen BYTEA")
+                if not self._columna_existe(cursor, tabla, 'imagen'):
+                    tipo_imagen = self.dialecto.blob()
+                    cursor.execute(f"ALTER TABLE {tabla} ADD COLUMN imagen {tipo_imagen}")
                     conn.commit()
+                    print(f"Migración: columna imagen agregada a {tabla}.")
         except Exception as e:
             print(f"Migración imagen omitida: {e}")
         if self.engine != 'sqlite':
@@ -162,8 +193,7 @@ class DatabaseManager:
         conn = self.connect()
         cursor = conn.cursor()
         try:
-            cols = [r[1] for r in cursor.execute("PRAGMA table_info(estaciones_produccion)").fetchall()]
-            if 'activo' not in cols:
+            if not self._columna_existe(cursor, 'estaciones_produccion', 'activo'):
                 cursor.execute(
                     "ALTER TABLE estaciones_produccion ADD COLUMN activo INTEGER NOT NULL DEFAULT 1")
                 conn.commit()
@@ -172,8 +202,7 @@ class DatabaseManager:
             print(f"Migración omitida: {e}")
 
         try:
-            cols = [r[1] for r in cursor.execute("PRAGMA table_info(programacion_semana)").fetchall()]
-            if 'fecha_inicio' not in cols:
+            if not self._columna_existe(cursor, 'programacion_semana', 'fecha_inicio'):
                 cursor.execute(
                     "ALTER TABLE programacion_semana ADD COLUMN fecha_inicio TEXT NOT NULL DEFAULT ''")
                 conn.commit()
@@ -182,8 +211,7 @@ class DatabaseManager:
             print(f"Migración fecha_inicio omitida: {e}")
 
         try:
-            cols = [r[1] for r in cursor.execute("PRAGMA table_info(programacion_lineas)").fetchall()]
-            if 'folio_pedido' not in cols:
+            if not self._columna_existe(cursor, 'programacion_lineas', 'folio_pedido'):
                 cursor.execute(
                     "ALTER TABLE programacion_lineas ADD COLUMN folio_pedido TEXT NOT NULL DEFAULT ''")
                 conn.commit()
@@ -192,14 +220,11 @@ class DatabaseManager:
             print(f"Migración folio_pedido omitida: {e}")
 
         try:
-            conn = self.connect()
-            cursor = conn.cursor()
-            cols = [r[1] for r in cursor.execute("PRAGMA table_info(programacion_lineas)").fetchall()]
-            if 'pedido_id' not in cols:
+            if not self._columna_existe(cursor, 'programacion_lineas', 'pedido_id'):
                 cursor.execute(
                     "ALTER TABLE programacion_lineas ADD COLUMN pedido_id INTEGER")
                 print("Migración: columna pedido_id agregada a programacion_lineas.")
-            if 'detalle_pedido_id' not in cols:
+            if not self._columna_existe(cursor, 'programacion_lineas', 'detalle_pedido_id'):
                 cursor.execute(
                     "ALTER TABLE programacion_lineas ADD COLUMN detalle_pedido_id INTEGER")
                 print("Migración: columna detalle_pedido_id agregada a programacion_lineas.")
@@ -208,18 +233,15 @@ class DatabaseManager:
             print(f"Migración pedido_id omitida: {e}")
 
         try:
-            conn = self.connect()
-            cursor = conn.cursor()
-            cols = [r[1] for r in cursor.execute("PRAGMA table_info(pedidos_cliente)").fetchall()]
-            if 'folio_pedido' not in cols:
+            if not self._columna_existe(cursor, 'pedidos_cliente', 'folio_pedido'):
                 cursor.execute(
                     "ALTER TABLE pedidos_cliente ADD COLUMN folio_pedido TEXT NOT NULL DEFAULT ''")
                 print("Migración: columna folio_pedido agregada a pedidos_cliente.")
-            if 'suela' not in cols:
+            if not self._columna_existe(cursor, 'pedidos_cliente', 'suela'):
                 cursor.execute(
                     "ALTER TABLE pedidos_cliente ADD COLUMN suela TEXT NOT NULL DEFAULT ''")
                 print("Migración: columna suela agregada a pedidos_cliente.")
-            if 'horma' not in cols:
+            if not self._columna_existe(cursor, 'pedidos_cliente', 'horma'):
                 cursor.execute(
                     "ALTER TABLE pedidos_cliente ADD COLUMN horma TEXT NOT NULL DEFAULT ''")
                 print("Migración: columna horma agregada a pedidos_cliente.")
@@ -295,16 +317,15 @@ class DatabaseManager:
             conn.commit()
             cursor.execute("PRAGMA foreign_keys=OFF")
 
-            cols = [r[1] for r in cursor.execute("PRAGMA table_info(ordenes_compra)").fetchall()]
-            if 'metodo_pago' not in cols:
+            if not self._columna_existe(cursor, 'ordenes_compra', 'metodo_pago'):
                 cursor.execute(
                     "ALTER TABLE ordenes_compra ADD COLUMN metodo_pago TEXT NOT NULL DEFAULT 'Transferencia bancaria'")
                 print("Migración: columna metodo_pago agregada a ordenes_compra.")
-            if 'solo_remision' not in cols:
+            if not self._columna_existe(cursor, 'ordenes_compra', 'solo_remision'):
                 cursor.execute(
                     "ALTER TABLE ordenes_compra ADD COLUMN solo_remision INTEGER NOT NULL DEFAULT 0")
                 print("Migración: columna solo_remision agregada a ordenes_compra.")
-            if 'tipo' not in cols:
+            if not self._columna_existe(cursor, 'ordenes_compra', 'tipo'):
                 cursor.execute(
                     "ALTER TABLE ordenes_compra ADD COLUMN tipo TEXT NOT NULL DEFAULT 'orden'")
                 print("Migración: columna tipo agregada a ordenes_compra.")
@@ -324,14 +345,12 @@ class DatabaseManager:
                 )
             """)
 
-            puntos_cols = [r[1] for r in cursor.execute("PRAGMA table_info(detalle_orden_compra_puntos)").fetchall()]
-            if 'precio_unitario' not in puntos_cols:
+            if not self._columna_existe(cursor, 'detalle_orden_compra_puntos', 'precio_unitario'):
                 cursor.execute(
                     "ALTER TABLE detalle_orden_compra_puntos ADD COLUMN precio_unitario REAL NOT NULL DEFAULT 0")
                 print("Migración: columna precio_unitario agregada a detalle_orden_compra_puntos.")
 
-            prov_cols = [r[1] for r in cursor.execute("PRAGMA table_info(proveedores)").fetchall()]
-            if 'nombre_comercial' not in prov_cols:
+            if not self._columna_existe(cursor, 'proveedores', 'nombre_comercial'):
                 cursor.execute(
                     "ALTER TABLE proveedores ADD COLUMN nombre_comercial TEXT")
                 print("Migración: columna nombre_comercial agregada a proveedores.")
@@ -353,6 +372,7 @@ class DatabaseManager:
         self._migrar_empresa_id()
         self._migrar_indices()
         self._migrar_sync()
+        self._migrar_uuids()
 
     def _migrar_empresa_id(self) -> None:
         """Multi-tenant: agrega empresa_id a las tablas principales.
@@ -392,25 +412,16 @@ class DatabaseManager:
                     nullable = '' if es_usuarios else ' NOT NULL'
                     default = '' if es_usuarios else f" DEFAULT '{empresa_id}'"
 
-                    if self.engine == 'sqlite':
-                        cols = [r[1] for r in cursor.execute(
-                            f"PRAGMA table_info({tabla})").fetchall()]
-                        if 'empresa_id' not in cols:
-                            cursor.execute(
-                                f"ALTER TABLE {tabla} ADD COLUMN empresa_id TEXT{nullable}{default}")
-                            print(f"  {tabla}: empresa_id agregado")
-                        else:
-                            # Actualizar registros sin empresa_id (solo tablas NOT NULL)
-                            if not es_usuarios:
-                                cursor.execute(
-                                    f"UPDATE {tabla} SET empresa_id = ? WHERE empresa_id = '' OR empresa_id IS NULL",
-                                    (empresa_id,))
-                    else:
+                    if not self._columna_existe(cursor, tabla, 'empresa_id'):
                         cursor.execute(
-                            f"ALTER TABLE {tabla} ADD COLUMN IF NOT EXISTS empresa_id TEXT{nullable}{default}")
+                            f"ALTER TABLE {tabla} ADD COLUMN empresa_id TEXT{nullable}{default}")
+                        print(f"  {tabla}: empresa_id agregado")
+                    else:
+                        # Actualizar registros sin empresa_id (solo tablas NOT NULL)
                         if not es_usuarios:
                             cursor.execute(
-                                f"UPDATE {tabla} SET empresa_id = %s WHERE empresa_id = '' OR empresa_id IS NULL",
+                                self._adaptar(
+                                    f"UPDATE {tabla} SET empresa_id = ? WHERE empresa_id = '' OR empresa_id IS NULL"),
                                 (empresa_id,))
                 except Exception as e:
                     print(f"  {tabla}: migracion empresa_id omitida - {e}")
@@ -578,23 +589,72 @@ class DatabaseManager:
             ]
             for tabla in tablas_soft_delete:
                 try:
-                    if self.engine == 'sqlite':
-                        cols = [r[1] for r in cursor.execute(
-                            f"PRAGMA table_info({tabla})").fetchall()]
-                        if 'is_deleted' not in cols:
-                            cursor.execute(
-                                f"ALTER TABLE {tabla} ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
-                            print(f"  {tabla}: is_deleted agregado")
-                    else:
+                    if not self._columna_existe(cursor, tabla, 'is_deleted'):
                         cursor.execute(
-                            f"ALTER TABLE {tabla} ADD COLUMN IF NOT EXISTS "
-                            f"is_deleted BOOLEAN NOT NULL DEFAULT FALSE")
+                            f"ALTER TABLE {tabla} ADD COLUMN is_deleted "
+                            f"{self.dialecto.booleano()} NOT NULL DEFAULT 0")
+                        print(f"  {tabla}: is_deleted agregado")
                 except Exception:
                     pass  # Tabla no existe aún
             conn.commit()
             print("Migración sync_queue + is_deleted completada.")
         except Exception as e:
             print(f"Migración sync omitida: {e}")
+
+    def _migrar_uuids(self) -> None:
+        """Identidad global por registro en tablas sincronizables.
+
+        Agrega la columna `uuid` (TEXT) con índice único a las tablas que
+        se sincronizan con Supabase y rellena con uuid4 las filas existentes
+        que no lo tengan. La columna es nullable: los INSERT de los modelos
+        no la conocen aún, y sync_hooks la garantiza al encolar (si falta,
+        se genera y se persiste). Idempotente.
+        """
+        try:
+            conn = self.connect()
+            cursor = conn.cursor()
+            for tabla in _TABLAS_SINCRONIZABLES:
+                try:
+                    if not self._columna_existe(cursor, tabla, 'uuid'):
+                        cursor.execute(
+                            f"ALTER TABLE {tabla} ADD COLUMN uuid TEXT")
+                        conn.commit()
+                        print(f"Migración uuid: columna agregada a {tabla}.")
+                    # Índice único: los NULL no colisionan entre sí.
+                    cursor.execute(
+                        f"CREATE UNIQUE INDEX IF NOT EXISTS "
+                        f"idx_{tabla}_uuid ON {tabla} (uuid)")
+                except Exception as e:
+                    print(f"Migración uuid: {tabla} omitida - {e}")
+            conn.commit()
+            self._backfill_uuids(cursor)
+            conn.commit()
+            print("Migración uuid completada.")
+        except Exception as e:
+            print(f"Migración uuid omitida: {e}")
+
+    def _backfill_uuids(self, cursor) -> None:
+        """Rellena uuid4 en filas existentes de tablas sincronizables.
+
+        Se ejecuta en cada arranque: solo toca filas con uuid NULL o vacío
+        (las filas nuevas las garantiza sync_hooks al encolar).
+        """
+        for tabla in _TABLAS_SINCRONIZABLES:
+            try:
+                if not self._columna_existe(cursor, tabla, 'uuid'):
+                    continue
+                filas = cursor.execute(
+                    f"SELECT id FROM {tabla} "
+                    "WHERE uuid IS NULL OR uuid = ''").fetchall()
+                if not filas:
+                    continue
+                cursor.executemany(
+                    f"UPDATE {tabla} SET uuid = ? WHERE id = ?",
+                    [(str(uuid.uuid4()), r[0]) for r in filas],
+                )
+                print(f"Migración uuid: {len(filas)} uuid asignados en {tabla}.")
+            except Exception as e:
+                print(f"Migración uuid backfill: {tabla} omitida - {e}")
 
     def _migrar_impresiones_historico(self) -> None:
         """Garantiza la tabla del histórico de la cola de impresión.
@@ -827,14 +887,7 @@ class DatabaseManager:
         try:
             conn = self.connect()
             cursor = conn.cursor()
-            if self.engine == 'sqlite':
-                tablas = {r[0] for r in cursor.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-            else:
-                tablas = {r[0] for r in cursor.execute(
-                    "SELECT table_name FROM information_schema.tables "
-                    "WHERE table_schema='public'").fetchall()}
-            if 'movimientos_inventario' not in tablas:
+            if not self._tabla_existe(cursor, 'movimientos_inventario'):
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS movimientos_inventario (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -845,7 +898,7 @@ class DatabaseManager:
                         created_at TEXT NOT NULL DEFAULT (datetime('now'))
                     )
                 """)
-            if 'detalle_movimiento_inventario' not in tablas:
+            if not self._tabla_existe(cursor, 'detalle_movimiento_inventario'):
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS detalle_movimiento_inventario (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -874,17 +927,7 @@ class DatabaseManager:
         cursor = conn.cursor()
         try:
             def tabla_existe(nombre: str) -> bool:
-                if self.engine == 'sqlite':
-                    row = cursor.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                        (nombre,),
-                    ).fetchone()
-                    return row is not None
-                row = cursor.execute(
-                    "SELECT 1 FROM information_schema.tables WHERE table_name=%s",
-                    (nombre,),
-                ).fetchone()
-                return row is not None
+                return self._tabla_existe(cursor, nombre)
 
             existe_puntos = tabla_existe('puntos_catalogo')
             existe_corrida = tabla_existe('tallas_corrida')
@@ -1281,7 +1324,7 @@ class DatabaseManager:
         try:
             conn = self.connect()
             cursor = conn.cursor()
-            ph = "%s" if self.engine == 'postgresql' else "?"
+            ph = self.dialecto.placeholder
             filas = cursor.execute("SELECT id, password_hash FROM usuarios").fetchall()
             migradas = 0
             for usuario_id, almacenado in filas:
@@ -1302,16 +1345,7 @@ class DatabaseManager:
         try:
             conn = self.connect()
             cursor = conn.cursor()
-            if self.engine == 'sqlite':
-                tablas = {r[0] for r in cursor.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()}
-            else:
-                tablas = {r[0] for r in cursor.execute(
-                    "SELECT table_name FROM information_schema.tables "
-                    "WHERE table_schema='public'"
-                ).fetchall()}
-            if 'configuracion_empresa' not in tablas:
+            if not self._tabla_existe(cursor, 'configuracion_empresa'):
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS configuracion_empresa (
                         clave TEXT PRIMARY KEY,

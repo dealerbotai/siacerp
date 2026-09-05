@@ -1,4 +1,5 @@
 from typing import Optional
+from src.database.base_repositorio import BaseRepositorio
 from src.database.db_manager import DatabaseManager
 from src.utils.empresa_context import donde_empresa, parametros_empresa
 from src.utils.sync_hooks import sync_insert, sync_update, sync_delete
@@ -15,16 +16,28 @@ def _subtotal_detalle_oc(d: dict) -> float:
     return float(d.get("cantidad", 0) or 0) * float(d.get("precio_unitario", 0) or 0)
 
 
-class ProveedorModel:
-    def __init__(self) -> None:
-        self.db = DatabaseManager()
+class ProveedorModel(BaseRepositorio):
+    """Proveedores: CRUD heredado + búsqueda explícita con LIKE multi-tenant."""
 
-    def listar(self, solo_activos: bool = True) -> list[dict]:
-        query = "SELECT * FROM proveedores"
-        if solo_activos:
-            query += " WHERE activo = 1"
-        query += " ORDER BY nombre"
-        return self.db.fetch_all(query)
+    tabla = "proveedores"
+    sincronizable = True            # en TABLAS_SUBIR del SyncService
+    con_soft_delete = True
+    usa_empresa = True
+    orden_por_defecto = "nombre"
+
+    def crear(self, rfc: str, nombre: str, telefono: str = "", email: str = "",
+              direccion: str = "", nombre_comercial: str = "") -> int:
+        return super().crear({
+            "rfc": rfc, "nombre": nombre, "nombre_comercial": nombre_comercial,
+            "telefono": telefono, "email": email, "direccion": direccion,
+        })
+
+    def actualizar(self, proveedor_id: int, rfc: str, nombre: str, telefono: str,
+                   email: str, direccion: str, nombre_comercial: str = "") -> None:
+        super().actualizar(proveedor_id, {
+            "rfc": rfc, "nombre": nombre, "nombre_comercial": nombre_comercial,
+            "telefono": telefono, "email": email, "direccion": direccion,
+        })
 
     def buscar(self, termino: str) -> list[dict]:
         q = "%" + termino + "%"
@@ -36,29 +49,6 @@ class ProveedorModel:
             + where_emp + " ORDER BY nombre",
             tuple(params),
         )
-
-    def obtener(self, proveedor_id: int) -> Optional[dict]:
-        return self.db.fetch_one("SELECT * FROM proveedores WHERE id = ?", (proveedor_id,))
-
-    def crear(self, rfc: str, nombre: str, telefono: str = "", email: str = "",
-              direccion: str = "", nombre_comercial: str = "") -> int:
-        cursor = self.db.execute(
-            "INSERT INTO proveedores (rfc, nombre, nombre_comercial, telefono, email, direccion) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (rfc, nombre, nombre_comercial, telefono, email, direccion),
-        )
-        return cursor.lastrowid
-
-    def actualizar(self, proveedor_id: int, rfc: str, nombre: str, telefono: str,
-                   email: str, direccion: str, nombre_comercial: str = "") -> None:
-        self.db.execute(
-            "UPDATE proveedores SET rfc=?, nombre=?, nombre_comercial=?, telefono=?, "
-            "email=?, direccion=? WHERE id=?",
-            (rfc, nombre, nombre_comercial, telefono, email, direccion, proveedor_id),
-        )
-
-    def desactivar(self, proveedor_id: int) -> None:
-        self.db.execute("UPDATE proveedores SET activo=0 WHERE id=?", (proveedor_id,))
 
 
 class ProveedorInsumosModel:
@@ -95,32 +85,20 @@ class ProveedorInsumosModel:
             )
 
 
-class UnidadesMedidaModel:
-    def __init__(self) -> None:
-        self.db = DatabaseManager()
+class UnidadesMedidaModel(BaseRepositorio):
+    """Catálogo de unidades de medida."""
 
-    def listar(self, solo_activos: bool = True) -> list[dict]:
-        query = "SELECT * FROM unidades_medida"
-        if solo_activos:
-            query += " WHERE activo = 1"
-        query += " ORDER BY nombre"
-        return self.db.fetch_all(query)
+    tabla = "unidades_medida"
+    sincronizable = False
+    con_soft_delete = False
+    usa_empresa = False
+    orden_por_defecto = "nombre"
 
     def crear(self, nombre: str, abreviatura: str) -> int:
-        cursor = self.db.execute(
-            "INSERT INTO unidades_medida (nombre, abreviatura) VALUES (?, ?)",
-            (nombre, abreviatura),
-        )
-        return cursor.lastrowid
+        return super().crear({"nombre": nombre, "abreviatura": abreviatura})
 
     def actualizar(self, unidad_id: int, nombre: str, abreviatura: str) -> None:
-        self.db.execute(
-            "UPDATE unidades_medida SET nombre=?, abreviatura=? WHERE id=?",
-            (nombre, abreviatura, unidad_id),
-        )
-
-    def desactivar(self, unidad_id: int) -> None:
-        self.db.execute("UPDATE unidades_medida SET activo=0 WHERE id=?", (unidad_id,))
+        super().actualizar(unidad_id, {"nombre": nombre, "abreviatura": abreviatura})
 
 
 class OrdenCompraModel:

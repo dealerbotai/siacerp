@@ -1,6 +1,26 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from src.database.db_manager import DatabaseManager
+
+
+# Última marca emitida en este proceso: garantiza que `registrar` produzca
+# marcas estrictamente crecientes aunque varias capturas caigan en el mismo
+# tic del reloj (datetime.now() tiene resolucion de microsegundos o menor),
+# de modo que el orden "del más reciente al más antiguo" sea determinista
+# (sin depender del desempate por id de la consulta).
+_ultima_marca: str = ""
+
+
+def _marca_uso() -> str:
+    """Marca de tiempo de uso, estrictamente creciente dentro del proceso."""
+    global _ultima_marca
+    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+    if _ultima_marca and ahora <= _ultima_marca:
+        base = datetime.strptime(_ultima_marca, "%Y-%m-%d %H:%M:%S.%f")
+        ahora = (base + timedelta(microseconds=1)
+                 ).strftime("%Y-%m-%d %H:%M:%S.%f")
+    _ultima_marca = ahora
+    return ahora
 
 
 class HistoricoCamposModel:
@@ -19,7 +39,7 @@ class HistoricoCamposModel:
         valor = (valor or "").strip()
         if not campo or not valor or len(valor) > 200:
             return
-        ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%f")
+        ahora = _marca_uso()
         self.db.execute(
             "INSERT INTO historico_campos (campo, valor, updated_at) "
             "VALUES (?, ?, ?) "

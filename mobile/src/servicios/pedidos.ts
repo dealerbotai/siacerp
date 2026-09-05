@@ -1,4 +1,5 @@
 import { supabase } from '../lib/supabase';
+import { generarUuid } from '../lib/uuid';
 import { obtenerEmpresaId } from './auth';
 import type {
   PedidoClienteMovil,
@@ -256,6 +257,7 @@ export async function programarPedido(
       .from('programacion_lineas_movil')
       .insert({
         empresa_id: empresaId,
+        uuid: generarUuid(),
         semana_id: semanaId,
         orden: ordenMax,
         folio_prog: folio,
@@ -282,6 +284,7 @@ export async function programarPedido(
     for (const t of tallasConPares) {
       await supabase.from('programacion_linea_tallas_movil').insert({
         empresa_id: empresaId,
+        uuid: generarUuid(),
         linea_id: linea.id,
         talla: t.talla,
         orden: parseFloat(t.talla),
@@ -408,6 +411,7 @@ export async function crearPedido(params: {
     .from('pedidos_cliente_movil')
     .insert({
       empresa_id: empresaId,
+      uuid: generarUuid(),
       folio,
       folio_pedido: params.folio_pedido || null,
       cliente_id: params.cliente_id,
@@ -435,6 +439,7 @@ export async function crearPedido(params: {
       .from('detalle_pedido_cliente_movil')
       .insert({
         empresa_id: empresaId,
+        uuid: generarUuid(),
         pedido_id: pedido.id,
         modelo: linea.modelo,
         piel: linea.piel,
@@ -449,6 +454,7 @@ export async function crearPedido(params: {
     for (const t of tallasConPares) {
       await supabase.from('detalle_pedido_puntos_movil').insert({
         empresa_id: empresaId,
+        uuid: generarUuid(),
         detalle_id: detalle.id,
         talla_id: t.talla_id,
         talla: t.talla,

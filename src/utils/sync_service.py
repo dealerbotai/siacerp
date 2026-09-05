@@ -231,7 +231,8 @@ class SyncService:
                     if snapshot:
                         datos = self._preparar_para_supabase(
                             tabla, snapshot, is_deleted=True)
-                        self.supabase.sincronizar_tabla(remote_table, [datos])
+                        self._enviar_registro(
+                            tabla, remote_table, registro_id, datos, 'DELETE')
                     eliminados += 1
 
                 elif operacion in ('INSERT', 'UPDATE'):
@@ -246,7 +247,8 @@ class SyncService:
                             self.queue.marcar_enviado(registro['id'])
                             continue
 
-                    self.supabase.sincronizar_tabla(remote_table, [datos_json])
+                    self._enviar_registro(
+                        tabla, remote_table, registro_id, datos_json, 'UPDATE')
                     subidos += 1
 
                 self.queue.marcar_enviado(registro['id'])
@@ -281,7 +283,9 @@ class SyncService:
                         self.queue.marcar_enviado(registro['id'])
                         continue
 
-                self.supabase.sincronizar_tabla(remote_table, [datos_json])
+                self._enviar_registro(
+                    tabla, remote_table, registro['registro_id'],
+                    datos_json, registro['operacion'])
                 self.queue.marcar_enviado(registro['id'])
                 reintentados += 1
 
@@ -289,6 +293,49 @@ class SyncService:
                 self.queue.marcar_error(registro['id'], str(e))
 
         return reintentados
+
+    def _enviar_registro(self, tabla: str, remote_table: str,
+                         registro_id: int, datos_json: dict,
+                         operacion: str) -> None:
+        """Enruta la subida de un registro a Supabase.
+
+        Con la bandera [sync] subir_por_uuid=1 usa el RPC
+        `subir_registro_sync` (merge por uuid, RD-9 fase 2). Prioriza el
+        snapshot vivo del registro (fila completa con uuid garantizado)
+        sobre el payload encolado, que puede estar parcial o viejo. Sin la
+        bandera, conserva el camino REST historico (merge por PK).
+
+        En el camino RPC lanza RuntimeError ante fallos para que el
+        registro quede en error y se reintente; el camino REST conserva el
+        comportamiento previo (no lanza).
+        """
+        if not self.supabase.subir_por_uuid_habilitado():
+            self.supabase.sincronizar_tabla(remote_table, [datos_json])
+            return
+
+        snapshot = self.queue.snapshot_registro(tabla, registro_id)
+        datos = None
+        if snapshot is not None:
+            datos = self._preparar_para_supabase(
+                tabla, snapshot,
+                is_deleted=(operacion == 'DELETE'))
+        elif datos_json is not None:
+            datos = self._preparar_para_supabase(
+                tabla, dict(datos_json),
+                is_deleted=(operacion == 'DELETE'))
+        if datos is None:
+            return  # Sin datos (fila borrada): no hay nada que subir
+
+        resultado = self.supabase.subir_registro_por_uuid(
+            remote_table, datos)
+        if resultado.get('ok'):
+            return
+        error = resultado.get('error', '')
+        if '404' in error:
+            # RPC aun no desplegado en Supabase: respaldo al camino REST.
+            self.supabase.sincronizar_tabla(remote_table, [datos])
+            return
+        raise RuntimeError(error)
 
     # ------------------------------------------------------------------
     # Bajar: Supabase -> local
@@ -328,54 +375,92 @@ class SyncService:
         return registro
 
     def _upsert_local(self, tabla: str, registro: dict) -> None:
-        """Inserta o actualiza un registro en la BD local."""
+        """Inserta o actualiza un registro en la BD local.
+
+        La identidad se resuelve por `uuid` cuando el registro lo trae
+        (identidad global estable entre terminales). Si no existe localmente,
+        se inserta conservando el id remoto siempre que esté libre; si el id
+        ya lo ocupa otra fila (colisión), se asigna uno nuevo y se preserva
+        el uuid, de modo que futuras bajadas vuelvan a hacer match por uuid.
+        """
         try:
             if 'id' not in registro or registro['id'] is None:
                 return
 
             registro_id = registro['id']
-            existente = self.db.fetch_one(
-                f'SELECT id FROM {tabla} WHERE id = ?', (registro_id,)
-            )
+            uuid_val = registro.get('uuid')
+            local_id = None
+
+            # 1. Resolver la identidad por uuid (preferente).
+            if uuid_val:
+                fila_uuid = self.db.fetch_one(
+                    f'SELECT id FROM {tabla} WHERE uuid = ?', (uuid_val,)
+                )
+                if fila_uuid:
+                    local_id = fila_uuid['id']
+
+            # 2. Si no hay uuid o no existía, buscar por id (modo legado).
+            if local_id is None:
+                existente = self.db.fetch_one(
+                    f'SELECT id FROM {tabla} WHERE id = ?', (registro_id,)
+                )
+                if existente:
+                    # El id ya existe pero con otro uuid: no pisar, es otra
+                    # fila. Solo se actualiza si coincide el uuid o la fila
+                    # local no tiene uuid (legado).
+                    if not uuid_val:
+                        local_id = existente['id']
+                    else:
+                        fila_legada = self.db.fetch_one(
+                            f'SELECT uuid FROM {tabla} WHERE id = ?',
+                            (registro_id,))
+                        if fila_legada and not fila_legada.get('uuid'):
+                            # Fila legada sin uuid: adoptar el del remoto.
+                            local_id = existente['id']
 
             cols_disponibles = self._obtener_columnas(tabla)
             cols = [k for k in registro.keys()
                     if k != 'id' and k in cols_disponibles]
 
-            if existente:
+            if local_id is not None:
                 if cols:
                     set_clause = ', '.join(f'{c} = ?' for c in cols)
-                    valores = tuple(registro[c] for c in cols) + (registro_id,)
+                    valores = tuple(registro[c] for c in cols) + (local_id,)
                     self.db.execute(
                         f'UPDATE {tabla} SET {set_clause} WHERE id = ?',
                         valores,
                     )
             else:
                 if cols:
-                    placeholders = ', '.join('?' * (len(cols) + 1))
-                    col_names = 'id, ' + ', '.join(cols)
-                    valores = (registro_id,) + tuple(registro[c] for c in cols)
-                    self.db.execute(
-                        f'INSERT INTO {tabla} ({col_names}) VALUES ({placeholders})',
-                        valores,
-                    )
+                    # Insertar con el id remoto si está libre; si colisiona,
+                    # dejar que el motor asigne uno nuevo (autoincrement).
+                    ocupado = self.db.fetch_one(
+                        f'SELECT id FROM {tabla} WHERE id = ?',
+                        (registro_id,))
+                    if not ocupado:
+                        col_names = 'id, ' + ', '.join(cols)
+                        placeholders = ', '.join('?' * (len(cols) + 1))
+                        valores = ((registro_id,) +
+                                   tuple(registro[c] for c in cols))
+                        self.db.execute(
+                            f'INSERT INTO {tabla} ({col_names}) '
+                            f'VALUES ({placeholders})', valores)
+                    else:
+                        col_names = ', '.join(cols)
+                        placeholders = ', '.join('?' * len(cols))
+                        self.db.execute(
+                            f'INSERT INTO {tabla} ({col_names}) '
+                            f'VALUES ({placeholders})',
+                            tuple(registro[c] for c in cols),
+                        )
         except Exception as e:
             print(f'  [Sync] upsert {tabla}#{registro.get("id")}: {e}')
 
     def _obtener_columnas(self, tabla: str) -> list[str]:
-        """Obtiene las columnas de una tabla."""
+        """Obtiene las columnas de una tabla (vía dialecto activo)."""
         try:
-            if self.db.engine == 'sqlite':
-                conn = self.db.connect()
-                cursor = conn.cursor()
-                return [r[1] for r in cursor.execute(
-                    f'PRAGMA table_info({tabla})').fetchall()]
-            else:
-                conn = self.db.connect()
-                cursor = conn.cursor()
-                cursor.execute(
-                    'SELECT column_name FROM information_schema.columns '
-                    'WHERE table_name = %s', (tabla,))
-                return [r[0] for r in cursor.fetchall()]
+            conn = self.db.connect()
+            cursor = conn.cursor()
+            return self.db.dialecto.obtener_columnas(cursor, tabla)
         except Exception:
             return []

@@ -1,24 +1,31 @@
 from typing import Optional
+from src.database.base_repositorio import BaseRepositorio
 from src.database.db_manager import DatabaseManager
 from src.utils.empresa_context import donde_empresa, parametros_empresa
 from src.utils.sync_hooks import sync_insert, sync_update, sync_delete
 
 
-class InsumoModel:
+class InsumoModel(BaseRepositorio):
+    """Insumos: CRUD con sync curado (payload sin imagen BLOB).
+
+    Hereda la infraestructura del repositorio base (filtros multi-tenant,
+    obtener, contar) y conserva sus consultas especializadas (búsquedas,
+    stock, categorías) y sus writes con sync hooks y updated_at explícitos.
+    """
+
+    tabla = "insumos"
+    sincronizable = True
+    con_soft_delete = True
+    usa_empresa = True
+    orden_por_defecto = "nombre"
+
     _COLUMNAS = ("id", "codigo", "nombre", "categoria", "unidad_medida",
                  "stock_actual", "stock_minimo", "activo", "created_at", "updated_at")
 
-    def __init__(self) -> None:
-        self.db = DatabaseManager()
-
     def listar(self, solo_activos: bool = True) -> list[dict]:
-        where_emp = donde_empresa()
-        params = list(parametros_empresa())
-        query = f"SELECT {', '.join(self._COLUMNAS)} FROM insumos WHERE 1=1"
-        if solo_activos:
-            query += " AND activo = 1"
-        query += where_emp
-        query += " ORDER BY nombre"
+        where, params = self._filtros(solo_activos)
+        query = (f"SELECT {', '.join(self._COLUMNAS)} FROM insumos{where}"
+                 f" ORDER BY nombre")
         return self.db.fetch_all(query, tuple(params))
 
     def buscar(self, termino: str) -> list[dict]:
