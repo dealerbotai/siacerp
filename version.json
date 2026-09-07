@@ -1,10 +1,10 @@
 {
-  "version": "2026.9.3",
-  "url_descarga": "https://github.com/gorettiboots-commits/siacerp/releases/latest",
-  "url_instalador": "https://github.com/gorettiboots-commits/siacerp/releases/latest/download/SIAC_ERP_Instalador_1.2.0.exe",
-  "url_changelog": "https://github.com/gorettiboots-commits/siacerp/blob/main/CHANGELOG.md",
-  "fecha": "2026-09-03",
-  "mensaje": "Gantt de produccion, manual de usuario navegable, buscador global mejorado, code signing, instalador NSIS, ayuda contextual en vistas",
+  "version": "2026.9.7",
+  "url_descarga": "https://github.com/dealerbotai/siacerp/releases/latest",
+  "url_instalador": "https://github.com/dealerbotai/siacerp/releases/download/v2026.9.7/SIAC_ERP_Instalador_1.2.1.exe",
+  "url_changelog": "https://github.com/dealerbotai/siacerp/blob/main/CHANGELOG.md",
+  "fecha": "2026-09-07",
+  "mensaje": "Rebuild completo del ejecutable e instalador NSIS, actualizacion de dependencias y mejoras de estabilidad",
   "obligatorio": false,
   "hash_sha256": "",
   "firma_requerida": true
