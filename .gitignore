@@ -57,3 +57,6 @@ mobile/.expo/
 # Chrome downloads
 *.crdownload
 Unconfirmed*
+
+# Estimación de costos (documento interno)
+scripts/estimacion_costos.py
